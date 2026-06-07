@@ -11,19 +11,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
-        working-directory: monday-brief
         run: pip install -r requirements.txt
 
       - name: Run brief
-        working-directory: monday-brief
         env:
           HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
@@ -35,10 +33,10 @@ jobs:
 
       - name: Upload HTML artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: pipeline-brief-html
           path: |
-            monday-brief/dsn-pipeline-brief-live.html
-            monday-brief/dsn-pipeline-brief-email.html
+            dsn-pipeline-brief-live.html
+            dsn-pipeline-brief-email.html
           if-no-files-found: ignore
