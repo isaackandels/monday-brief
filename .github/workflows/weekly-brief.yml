@@ -1,0 +1,44 @@
+name: Weekly Pipeline Brief
+
+on:
+  schedule:
+    # Mondays 12:00 UTC (~7-8am US Eastern). Cron is UTC.
+    - cron: "0 12 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  send-brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: monday-brief
+        run: pip install -r requirements.txt
+
+      - name: Run brief
+        working-directory: monday-brief
+        env:
+          HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          BRIEF_FROM_EMAIL: ${{ secrets.BRIEF_FROM_EMAIL }}
+          BRIEF_TO_EMAIL: ${{ secrets.BRIEF_TO_EMAIL }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python runner.py
+
+      - name: Upload HTML artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-brief-html
+          path: |
+            monday-brief/dsn-pipeline-brief-live.html
+            monday-brief/dsn-pipeline-brief-email.html
+          if-no-files-found: ignore

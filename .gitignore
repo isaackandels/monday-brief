@@ -1,0 +1,14 @@
+# Local secrets — never commit
+.hubspot_token
+.env
+*.local
+
+# Generated artifacts
+dsn-pipeline-brief-live.html
+dsn-pipeline-brief-email.html
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
