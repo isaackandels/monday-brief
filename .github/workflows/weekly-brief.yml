@@ -2,9 +2,9 @@ name: Weekly Pipeline Brief
 
 on:
   schedule:
-    # TEMP schedule test — fires 2026-06-08 15:15 UTC (11:15 AM EDT).
+    # TEMP schedule test — fires every 10 minutes.
     # TODO: restore to "0 12 * * 1" (Mondays 12:00 UTC, ~7-8am US Eastern) after the test.
-    - cron: "15 15 * * 1"
+    - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
 jobs:
