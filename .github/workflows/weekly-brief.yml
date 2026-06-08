@@ -1,3 +1,4 @@
+# Re-registering the schedule trigger (temp every-10-min test).
 name: Weekly Pipeline Brief
 
 on:
