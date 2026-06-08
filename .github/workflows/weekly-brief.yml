@@ -2,8 +2,9 @@ name: Weekly Pipeline Brief
 
 on:
   schedule:
-    # Mondays 12:00 UTC (~7-8am US Eastern). Cron is UTC.
-    - cron: "0 12 * * 1"
+    # TEMP schedule test — fires 2026-06-08 15:15 UTC (11:15 AM EDT).
+    # TODO: restore to "0 12 * * 1" (Mondays 12:00 UTC, ~7-8am US Eastern) after the test.
+    - cron: "15 15 * * 1"
   workflow_dispatch: {}
 
 jobs:
