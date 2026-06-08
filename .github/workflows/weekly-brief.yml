@@ -1,11 +1,7 @@
-# Re-registering the schedule trigger (temp every-10-min test).
 name: Weekly Pipeline Brief
 
+# Triggered externally on a weekly cadence via the workflow_dispatch API.
 on:
-  schedule:
-    # TEMP schedule test — fires every 10 minutes.
-    # TODO: restore to "0 12 * * 1" (Mondays 12:00 UTC, ~7-8am US Eastern) after the test.
-    - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
 jobs:
