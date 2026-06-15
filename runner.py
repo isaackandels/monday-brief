@@ -232,11 +232,23 @@ def build(dry_run=False):
     if deals:
         enrich(client, deals)
 
-    # per-rep summary (smoke check)
-    print("per-rep stale deals:")
+    # 5c. global perio exclusion — drop deals whose associated company's
+    # specialty (company.practice_type) is Periodontist. No company or a
+    # different specialty stays.
+    pre = len(deals)
+    deals = [d for d in deals
+             if (d.get("company") or {}).get("practice_type") != "Periodontist"]
+    print(f"after perio exclusion: {len(deals)}  (dropped {pre - len(deals)} periodontist)")
+
+    # per-rep summary (smoke check), split the way the brief now renders
+    active = [d for d in deals if d["stage"] not in render.PARKED]
+    nurture = [d for d in deals if d["stage"] in render.PARKED]
+    print(f"per-rep STALE (active) deals — total {len(active)}:")
     for oid, name in render.REPS.items():
-        n = sum(1 for d in deals if d["owner"] == oid)
-        print(f"  {name}: {n}")
+        print(f"  {name}: {sum(1 for d in active if d['owner'] == oid)}")
+    print(f"per-rep NURTURE deals — total {len(nurture)}:")
+    for oid, name in render.REPS.items():
+        print(f"  {name}: {sum(1 for d in nurture if d['owner'] == oid)}")
 
     # 7. render
     html_desktop = render.render(deals, run_date)
@@ -249,9 +261,9 @@ def build(dry_run=False):
         f.write(html_email)
     print("wrote dsn-pipeline-brief-live.html and dsn-pipeline-brief-email.html")
 
-    total_arr = sum(render._arr_int(d) for d in deals)
-    subject = (f"Monday Pipeline Brief — {len(deals)} stale deals, "
-               f"${total_arr/1000:.0f}K at risk — {render.fmt_date(run_date)}")
+    active_arr = sum(render._arr_int(d) for d in active)
+    subject = (f"Monday Pipeline Brief — {len(active)} stale deals, "
+               f"${active_arr/1000:.0f}K at risk — {render.fmt_date(run_date)}")
 
     # 8. send
     if dry_run:

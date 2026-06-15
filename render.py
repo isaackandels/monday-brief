@@ -134,8 +134,6 @@ def deal_situation(d):
 def deal_tags(d):
     days = d["stale_days"]
     t = ['<span class="tag bad">No next step</span>']
-    if d.get("stage") in PARKED:
-        t.append('<span class="tag warn">Parked in nurture</span>')
     if arr_str(d.get("arr")) is None:
         t.append('<span class="tag warn">No ARR</span>')
     nm = (d.get("name") or "").strip()
@@ -215,6 +213,9 @@ a.nm:hover{color:var(--accent);text-decoration:underline;}
 .tag.ok{background:#E4F2EA;color:var(--ok);}
 .more{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--faint);padding:6px 0 2px;font-style:italic;}
 .empty{padding:14px 38px 20px;font-size:13.5px;color:var(--faint);font-style:italic;}
+.section-banner{background:var(--ink-2);color:#fff;padding:22px 38px;border-top:1px solid rgba(255,255,255,0.08);}
+.section-banner .h{font-family:'Fraunces',serif;font-size:23px;font-weight:600;letter-spacing:-0.01em;}
+.section-banner .s{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:#8FA3B6;font-weight:600;margin-top:5px;}
 .foot{background:var(--ink);color:#A9BBCB;border-radius:0 0 14px 14px;padding:26px 38px 30px;font-size:12.5px;line-height:1.65;}
 .foot h4{font-family:'JetBrains Mono',monospace;font-size:10.5px;letter-spacing:0.18em;text-transform:uppercase;color:var(--glow);font-weight:600;margin-bottom:12px;}
 .foot ul{list-style:none;}.foot li{padding:3px 0 3px 18px;position:relative;}.foot li::before{content:"›";position:absolute;left:0;color:var(--glow);}
@@ -265,17 +266,26 @@ def _build_parts(deals, run_date, css, web_fonts, flag_text, email_mode=False):
     (with an MSO conditional table fallback) so Outlook-on-Windows renders the
     layout at native size instead of downscaling it, which is what blurs it.
     """
-    # group + sort
-    deals_by_rep = {o: [] for o in REPS}
-    for d in deals:
-        deals_by_rep.setdefault(d["owner"], [])
-        deals_by_rep[d["owner"]].append(d)
-    for o in deals_by_rep:
-        deals_by_rep[o].sort(key=lambda x: x["stale_days"], reverse=True)
+    # split active vs parked-nurture, then group + sort each by rep
+    active = [d for d in deals if d.get("stage") not in PARKED]
+    nurture = [d for d in deals if d.get("stage") in PARKED]
 
-    total_deals = len(deals)
-    total_arr = sum(_arr_int(d) for d in deals)
-    oldest = max((d["stale_days"] for d in deals), default=0)
+    def _group(items):
+        by_rep = {o: [] for o in REPS}
+        for d in items:
+            by_rep.setdefault(d["owner"], [])
+            by_rep[d["owner"]].append(d)
+        for o in by_rep:
+            by_rep[o].sort(key=lambda x: x["stale_days"], reverse=True)
+        return by_rep
+
+    deals_by_rep = _group(active)
+    nurture_by_rep = _group(nurture)
+
+    total_deals = len(active)
+    total_nurture = len(nurture)
+    total_arr = sum(_arr_int(d) for d in active)
+    oldest = max((d["stale_days"] for d in active), default=0)
     run_str = fmt_date(run_date)
 
     head_fonts = (
@@ -332,15 +342,36 @@ A deal is stale only when it has <b>no future next step booked</b> and <b>no gen
             parts.append('<div class="empty">No stale deals this week.</div>')
         parts.append('</div>')
 
+    # nurture section: parked deals, same staleness rule, displayed separately
+    if nurture:
+        parts.append(f"""<div class="section-banner"><div class="h">Nurture</div>
+<div class="s">Parked deals · cold {DEFAULT_STALE_DAYS}+ days · {total_nurture} total</div></div>""")
+        for o in REP_ORDER:
+            ns = nurture_by_rep.get(o, [])
+            if not ns:
+                continue
+            n_arr = sum(_arr_int(d) for d in ns)
+            shown = ns[:CAP]
+            parts.append(f"""<div class="rep"><div class="rep-head"><div class="rep-name">{REPS[o]}</div>
+<div class="rep-stats"><span><b>{len(ns)}</b> nurture</span><span class="sep">·</span><span class="risk"><b>${n_arr/1000:.0f}K</b> at risk</span></div></div>""")
+            parts.append('<div class="subhead">Nurture · longest silent first</div>')
+            body = "".join(deal_row(d) for d in shown)
+            if len(ns) > CAP:
+                body += f'<div class="more">+ {len(ns)-CAP} more nurture deals not shown.</div>'
+            parts.append('<div class="deals">' + body + '</div>')
+            parts.append('</div>')
+
     parts.append(f"""<div class="foot"><h4>How this brief is built</h4><ul>
 <li><b>Live data</b> from HubSpot portal {PORTAL}. Every title links to its real record. Nothing is fabricated.</li>
 <li><b>Stale deal:</b> open deal in New Customer + Existing (Cloud/Atlas), no future next step, and no genuine human touch in {DEFAULT_STALE_DAYS}+ days.</li>
 <li><b>Staleness clock:</b> the runner pulls each deal's real engagement records (notes, calls, emails, meetings, completed tasks) plus manual stage changes and clocks off the most recent. Workflow/automation events are ignored, so a deal worked through notes or stage moves no longer reads as cold, and one coasting on automation no longer reads as fresh.</li>
 <li><b>Next-step gate:</b> any open task, scheduled meeting or call with a future date keeps a deal out of the brief — it is being worked.</li>
 <li><b>Enrichment:</b> company PMS, specialty and location count, plus the primary contact, are attached from associated records. Only real, id-linked values are printed.</li>
-<li><b>Tags:</b> No next step, Parked in nurture, No ARR, Incomplete record, 120+ days cold flag where the deal or its data needs work before outreach.</li>
+<li><b>Nurture split:</b> deals parked in a nurture stage are moved out of the main stale list into their own section below it, scored on the same staleness rule.</li>
+<li><b>Perio excluded:</b> deals whose associated company specialty is Periodontist are dropped from the brief entirely.</li>
+<li><b>Tags:</b> No next step, No ARR, Incomplete record, 120+ days cold flag where the deal or its data needs work before outreach.</li>
 <li><b>Display cap:</b> top {CAP} per rep by silence. Per-rep counts and ARR above reflect the full set.</li>
-</ul><div class="stamp">Generated {run_date.strftime('%Y-%m-%d')} from live HubSpot · {total_deals} stale deals</div></div>
+</ul><div class="stamp">Generated {run_date.strftime('%Y-%m-%d')} from live HubSpot · {total_deals} active stale · {total_nurture} nurture</div></div>
 {container_close}</body></html>""")
 
     return "".join(parts)
