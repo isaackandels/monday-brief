@@ -1,0 +1,26 @@
+name: Weekly GTM Deck
+
+# cron-job.org calls this every Friday via the GitHub API (workflow_dispatch).
+# The schedule line below is only a backup; trust cron-job.org for the real timing.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 14 * * 5"   # Fridays 14:00 UTC = 10am ET (summer). Backup only.
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install requests python-pptx python-dotenv
+      - name: Build and send weekly GTM deck
+        env:
+          HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python gtm_weekly_deck_email.py
