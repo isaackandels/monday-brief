@@ -15,7 +15,7 @@ Public API:
 from datetime import date
 
 PORTAL = "47651487"
-CAP = 12  # max deals shown per rep
+CAP = None  # max deals shown per rep; None = show all (no truncation)
 
 REPS = {
     "403415850": "Kim Cannon",
@@ -335,7 +335,7 @@ A deal is stale only when it has <b>no future next step booked</b> and <b>no gen
         parts.append('<div class="subhead">Stale Deals · longest silent first</div>')
         if shown:
             body = "".join(deal_row(d) for d in shown)
-            if len(ds) > CAP:
+            if CAP is not None and len(ds) > CAP:
                 body += f'<div class="more">+ {len(ds)-CAP} more stale deals not shown.</div>'
             parts.append('<div class="deals">' + body + '</div>')
         else:
@@ -356,7 +356,7 @@ A deal is stale only when it has <b>no future next step booked</b> and <b>no gen
 <div class="rep-stats"><span><b>{len(ns)}</b> nurture</span><span class="sep">·</span><span class="risk"><b>${n_arr/1000:.0f}K</b> at risk</span></div></div>""")
             parts.append('<div class="subhead">Nurture · longest silent first</div>')
             body = "".join(deal_row(d) for d in shown)
-            if len(ns) > CAP:
+            if CAP is not None and len(ns) > CAP:
                 body += f'<div class="more">+ {len(ns)-CAP} more nurture deals not shown.</div>'
             parts.append('<div class="deals">' + body + '</div>')
             parts.append('</div>')
@@ -370,7 +370,7 @@ A deal is stale only when it has <b>no future next step booked</b> and <b>no gen
 <li><b>Nurture split:</b> deals parked in a nurture stage are moved out of the main stale list into their own section below it, scored on the same staleness rule.</li>
 <li><b>Perio excluded:</b> deals whose associated company specialty is Periodontist are dropped from the brief entirely.</li>
 <li><b>Tags:</b> No next step, No ARR, Incomplete record, 120+ days cold flag where the deal or its data needs work before outreach.</li>
-<li><b>Display cap:</b> top {CAP} per rep by silence. Per-rep counts and ARR above reflect the full set.</li>
+<li><b>Display:</b> every stale deal is shown per rep, longest silent first. Per-rep counts and ARR reflect the full set.</li>
 </ul><div class="stamp">Generated {run_date.strftime('%Y-%m-%d')} from live HubSpot · {total_deals} active stale · {total_nurture} nurture</div></div>
 {container_close}</body></html>""")
 
