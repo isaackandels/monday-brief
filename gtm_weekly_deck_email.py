@@ -1,22 +1,28 @@
 """
-DSN GTM weekly report runner.
+DSN GTM monthly report runner.
 
-Pulls both views live from HubSpot for the trailing 9 weeks, builds the
-editable PowerPoint deck (via deck_builder), and emails it as a .pptx
-attachment through Resend. Same chain as the Monday stale-deal brief:
-cron-job.org -> GitHub Actions -> this script -> HubSpot -> Resend.
+Pulls both views live from HubSpot for the current year to date, buckets by
+calendar month, builds the editable PowerPoint deck (via the deck builder),
+and emails it as a .pptx attachment through Resend.
 
-Runner needs only: pip install requests python-pptx
+Only sends on the LAST FRIDAY of the month. cron-job.org keeps firing every
+Friday at 10am ET; this script decides whether today is the send day. To send
+on any other day (local testing or a manual run), set FORCE_SEND=1.
+
+Runner needs: pip install requests python-pptx python-dotenv
 (no LibreOffice; python-pptx writes the .pptx directly).
 
-Env vars (GitHub Actions secrets):
+Env vars (GitHub Actions secrets / local .env):
   HUBSPOT_TOKEN, RESEND_API_KEY, EMAIL_FROM, EMAIL_TO
+  FORCE_SEND (optional: "1" to bypass the last-Friday gate)
 """
 
 import os
 import base64
+import calendar
 import tempfile
 import datetime as dt
+
 import requests
 
 # Load a local .env file when testing on your computer.
@@ -29,10 +35,9 @@ except ImportError:
 
 from gtm_weekly_deck_builder import build_deck, k  # shared renderer
 
-WEEKS = 9
-REP_MODE = "distinct"   # "distinct" = owners who closed in the window; else "fixed"
-FIXED_REPS = {"New Logo Sales (Platform)": 3,
-              "Atlas / Cloud Upgrades": 3,
+REP_MODE = "distinct"   # "distinct" = owners who closed YTD; else "fixed"
+FIXED_REPS = {"New Logo Sales (Platform)": 4,
+              "Atlas / Cloud Upgrades": 4,
               "Strategic Accounts (DSOs)": 1}
 
 HUBSPOT_TOKEN = os.environ["HUBSPOT_TOKEN"]
@@ -64,31 +69,27 @@ CREATE_STREAMS = [
 
 
 # ---- dates ------------------------------------------------------------
-def week_ending_friday(d):
-    return d + dt.timedelta(days=(4 - d.weekday()) % 7)
+def is_last_friday(d):
+    """True if d is a Friday and the next Friday falls in a different month."""
+    return d.weekday() == 4 and (d + dt.timedelta(days=7)).month != d.month
 
 
 def build_window(today=None):
+    """Year-to-date months. Returns (year, month_numbers, labels, start, end)."""
     today = today or dt.date.today()
-    last_friday = today - dt.timedelta(days=(today.weekday() - 4) % 7)
-    cols = [last_friday - dt.timedelta(days=7 * (WEEKS - 1 - i))
-            for i in range(WEEKS)]
-    return cols, cols[0] - dt.timedelta(days=6), cols[-1]
+    year = today.year
+    months = list(range(1, today.month + 1))          # 1..current month
+    labels = [calendar.month_abbr[m] for m in months]  # Jan, Feb, ... portable
+    start = dt.date(year, 1, 1)
+    return year, months, labels, start, today
 
 
-def to_date(val):
-    """Parse a HubSpot timestamp (epoch-ms int/str or ISO 8601) to a date."""
-    s = str(val).strip()
+def parse_hs_date(value):
+    """HubSpot returns ISO 8601 strings (sometimes epoch ms). Handle both."""
+    s = str(value)
     if s.isdigit():
-        return dt.datetime.fromtimestamp(int(s) / 1000, tz=dt.timezone.utc).date()
-    d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
-    if d.tzinfo is None:
-        d = d.replace(tzinfo=dt.timezone.utc)
-    return d.date()
-
-
-def to_friday(ms):
-    return week_ending_friday(to_date(ms))
+        return dt.datetime.utcfromtimestamp(int(s) / 1000).date()
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).date()
 
 
 def ms_bounds(start, end):
@@ -116,10 +117,10 @@ def search(filters, props):
     return out
 
 
-def get_acquisitions(columns, start, end):
+def get_acquisitions(year, months, start, end):
     lo, hi = ms_bounds(start, end)
-    idx = {f: i for i, f in enumerate(columns)}
-    valid = set(columns)
+    n = len(months)
+    idx = {m: i for i, m in enumerate(months)}
     segments = []
     for seg in ACQ_SEGMENTS:
         filters = [
@@ -131,15 +132,15 @@ def get_acquisitions(columns, start, end):
         if seg["deal_type"]:
             filters.append({"propertyName": "existing_customer_deal_type",
                             "operator": "EQ", "value": seg["deal_type"]})
-        acq = [0] * WEEKS
-        arr = [0.0] * WEEKS
+        acq = [0] * n
+        arr = [0.0] * n
         owners = set()
         for d in search(filters, ["hs_arr", "closedate", "hubspot_owner_id"]):
             p = d["properties"]
-            f = to_friday(p["closedate"])
-            if f not in valid:
+            cd = parse_hs_date(p["closedate"])
+            if cd.year != year or cd.month not in idx:
                 continue
-            i = idx[f]
+            i = idx[cd.month]
             acq[i] += 1
             arr[i] += float(p.get("hs_arr") or 0)
             if p.get("hubspot_owner_id"):
@@ -151,10 +152,10 @@ def get_acquisitions(columns, start, end):
     return segments
 
 
-def get_creation(columns, start, end):
+def get_creation(year, months, start, end):
     lo, hi = ms_bounds(start, end)
-    idx = {f: i for i, f in enumerate(columns)}
-    valid = set(columns)
+    n = len(months)
+    idx = {m: i for i, m in enumerate(months)}
     rows = []
     for st in CREATE_STREAMS:
         filters = [
@@ -168,32 +169,30 @@ def get_creation(columns, start, end):
         if st["na"]:
             filters.append({"propertyName": "dealstage", "operator": "NEQ",
                             "value": st["na"]})
-        counts = [0] * WEEKS
+        counts = [0] * n
         for d in search(filters, ["createdate"]):
-            f = to_friday(d["properties"]["createdate"])
-            if f in valid:
-                counts[idx[f]] += 1
+            cd = parse_hs_date(d["properties"]["createdate"])
+            if cd.year == year and cd.month in idx:
+                counts[idx[cd.month]] += 1
         rows.append({"name": st["name"], "counts": counts})
     return rows
 
 
 # ---- send -------------------------------------------------------------
-def send(path, columns):
-    # %-d is not portable to Windows; format day without leading zero manually
-    through = columns[-1].strftime("%b ") + str(columns[-1].day)
+def send(path, through_label):
     with open(path, "rb") as fh:
         content = base64.b64encode(fh.read()).decode()
-    body = (f"<p style='font-family:Arial'>DSN GTM weekly through "
-            f"<b>{through}</b>. Editable PowerPoint attached: acquisitions and "
-            f"productivity by week, plus deal creation by pipeline.</p>")
+    body = (f"<p style='font-family:Arial'>DSN GTM monthly through "
+            f"<b>{through_label}</b>. Editable PowerPoint attached: acquisitions "
+            f"and productivity by month, plus deal creation by pipeline.</p>")
     r = requests.post(
         "https://api.resend.com/emails",
         headers={"Authorization": f"Bearer {RESEND_API_KEY}",
                  "Content-Type": "application/json"},
         json={"from": EMAIL_FROM, "to": [EMAIL_TO],
-              "subject": f"DSN GTM Weekly (through {through})",
+              "subject": f"DSN GTM Monthly (through {through_label})",
               "html": body,
-              "attachments": [{"filename": f"dsn-gtm-weekly-{through}.pptx",
+              "attachments": [{"filename": f"dsn-gtm-monthly-{through_label}.pptx",
                                "content": content}]},
         timeout=30,
     )
@@ -202,13 +201,22 @@ def send(path, columns):
 
 
 def main():
-    cols, start, end = build_window()
-    labels = [c.strftime("%b ") + str(c.day) for c in cols]
-    acq = get_acquisitions(cols, start, end)
-    create = get_creation(cols, start, end)
-    path = os.path.join(tempfile.gettempdir(), "dsn-gtm-weekly.pptx")
-    build_deck(labels, acq, create, path)
-    send(path, cols)
+    today = dt.date.today()
+    forced = os.environ.get("FORCE_SEND", "").lower() in ("1", "true", "yes")
+    if not forced and not is_last_friday(today):
+        print(f"{today} is not the last Friday of the month; skipping send. "
+              f"Set FORCE_SEND=1 to override.")
+        return
+
+    year, months, labels, start, end = build_window(today)
+    through_label = f"{calendar.month_abbr[months[-1]]} {year}"
+    acq = get_acquisitions(year, months, start, end)
+    create = get_creation(year, months, start, end)
+
+    path = os.path.join(tempfile.gettempdir(), "dsn-gtm-monthly.pptx")
+    build_deck(labels, acq, create, path,
+               period_label=f"{year} YTD", by_word="Month")
+    send(path, through_label)
 
 
 if __name__ == "__main__":
