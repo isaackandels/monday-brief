@@ -6,6 +6,7 @@ and emails the list every weekday morning. Runs on GitHub Actions cron.
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -583,27 +584,47 @@ Candidates:
 def claude_rank(candidates):
     body = {
         "model": CLAUDE_MODEL,
-        "max_tokens": 2000,
+        "max_tokens": 8000,
         "messages": [{
             "role": "user",
             "content": RANK_INSTRUCTIONS.format(
                 n=TOP_PICKS, candidates=json.dumps(candidates, default=str)
-            ),
+            ) + "\n\nBegin your reply with { immediately. No preamble.",
         }],
     }
-    r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        },
-        json=body, timeout=120,
-    )
-    r.raise_for_status()
-    text = "".join(b.get("text", "") for b in r.json()["content"])
-    text = text.replace("```json", "").replace("```", "").strip()
-    parsed = json.loads(text)
+    last_err = None
+    for attempt in range(2):
+        try:
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json=body, timeout=120,
+            )
+            r.raise_for_status()
+            data = r.json()
+            text = "".join(
+                b.get("text", "") for b in data.get("content", [])
+                if b.get("type") == "text")
+            m = re.search(r"\{.*\}", text, re.DOTALL)
+            if not m:
+                blocks = [b.get("type") for b in data.get("content", [])]
+                raise ValueError(
+                    f"no JSON in response (stop_reason="
+                    f"{data.get('stop_reason')}, blocks={blocks}, "
+                    f"text_len={len(text)})")
+            parsed = json.loads(m.group(0))
+            break
+        except (requests.RequestException, ValueError,
+                json.JSONDecodeError) as e:
+            last_err = e
+            print(f"Claude attempt {attempt + 1} failed: {e}", file=sys.stderr)
+    else:
+        raise last_err
+
     by_id = {c["id"]: c for c in candidates}
     picks = []
     for p in parsed.get("picks", []):
@@ -626,8 +647,26 @@ def fallback_rank(candidates):
         return (2, c.get("days_since_contacted") or 0)
     ranked = sorted(candidates, key=key)[:TOP_PICKS]
     for c in ranked:
-        c["reason"] = ""
-    return "Claude ranking unavailable today; rules-based order.", ranked
+        c["reason"] = fallback_reason(c)
+    return ("AI ranking was unavailable for this run; the list below is "
+            "ordered by rules (fresh MQLs, then biggest quiet deals)."), ranked
+
+
+def fallback_reason(c):
+    dsc = c.get("days_since_contacted")
+    touch = f"last contacted {dsc}d ago" if dsc is not None else "no contact ever logged"
+    if c.get("deal"):
+        d = c["deal"]
+        arr = f"${float(d['arr']):,.0f} ARR" if d.get("arr") else "open"
+        return f"{arr} deal quiet {d['days_quiet']} days; {touch}."
+    if c["source"] in ("new_mql", "existing_mql"):
+        age = c.get("created_days_ago")
+        age_txt = f"MQL for {age}d" if age is not None else "MQL"
+        return f"{age_txt}; {touch}."
+    if c["source"] == "warm_signal":
+        v = c.get("days_since_site_visit")
+        return f"Visited the site {v}d ago; {touch}."
+    return f"In the funnel; {touch}."
 
 
 # ---------------------------------------------------------------------------
@@ -654,8 +693,15 @@ ORANGE = "#C2410C"
 FONT = "'Segoe UI',-apple-system,Helvetica,Arial,sans-serif"
 
 
-def build_html(headline, picks, counts, overdue=None):
+def build_html(headline, picks, counts, overdue=None, used_fallback=False):
     overdue = overdue or {}
+    banner = ""
+    if used_fallback:
+        banner = (f'<tr><td style="padding:14px 32px 0;">'
+                  f'<div style="background:#FDF0E7;border-left:4px solid {ORANGE};'
+                  f'padding:10px 14px;font-size:13px;color:{ORANGE};font-weight:600;">'
+                  f'AI ranking failed on this run &mdash; reasons below are basic facts, '
+                  f'not judgment. Check the GitHub Actions log for the error.</div></td></tr>')
     groups = [(rep, [c for c in picks if c.get("owner") == rep])
               for rep in REPS.values()]
     groups.append(("Marketing / First Touch",
@@ -680,6 +726,7 @@ def build_html(headline, picks, counts, overdue=None):
     <div style="font-size:13px;color:#B8C4DE;margin-top:4px;">{today}</div>
   </td></tr>
 
+  {banner}
   <tr><td style="padding:20px 32px 0;">
     <div style="font-size:15px;line-height:1.55;color:{INK};">{headline}</div>
     <div style="font-size:12px;color:{MUTED};margin-top:12px;padding-bottom:16px;border-bottom:1px solid {LINE};">Candidate pool &nbsp;&rarr;&nbsp; {pool}</div>
@@ -764,16 +811,23 @@ def overdue_block(overdue):
     for person, tasks in people:
         rows = []
         for t in tasks:
-            who = f' &nbsp;&middot;&nbsp; {t["contact"]}' if t.get("contact") else ""
             if t.get("days_overdue") is not None:
-                age = f'<span style="color:{ORANGE};font-weight:700;">{t["days_overdue"]}d overdue</span>'
+                age = (f'<span style="color:{ORANGE};font-weight:700;">'
+                       f'{t["days_overdue"]}d overdue</span>')
             else:
-                age = f'<span style="color:{MUTED};font-weight:600;">open, no due date</span>'
+                age = (f'<span style="color:{MUTED};font-weight:600;">'
+                       f'no due date</span>')
+            who = (f'<div style="font-size:12px;color:{MUTED};margin-top:2px;">'
+                   f'{t["contact"]}</div>') if t.get("contact") else ""
+            subject = t["subject"][:96] + ("&hellip;" if len(t["subject"]) > 96 else "")
             rows.append(
-                f'<tr><td style="padding:7px 0;border-bottom:1px solid #F0E7DF;font-size:13px;">'
-                f'<a href="{t["link"]}" style="color:{ACCENT};text-decoration:underline;font-weight:600;">{t["subject"]}</a>'
-                f'<span style="color:{MUTED};">{who}</span>'
-                f' &nbsp;{age}</td></tr>')
+                f'<tr>'
+                f'<td style="padding:8px 12px 8px 0;border-bottom:1px solid #F0E7DF;font-size:13px;line-height:1.4;">'
+                f'<a href="{t["link"]}" style="color:{ACCENT};text-decoration:underline;font-weight:600;">{subject}</a>'
+                f'{who}</td>'
+                f'<td width="96" align="right" valign="top" style="padding:8px 0;border-bottom:1px solid #F0E7DF;'
+                f'font-size:12.5px;white-space:nowrap;">{age}</td>'
+                f'</tr>')
         blocks.append(
             f'<div style="font-size:13px;font-weight:700;color:{NAVY};margin:14px 0 2px;">{person}'
             f' &nbsp;<span style="font-weight:400;color:{MUTED};">({len(tasks)})</span></div>'
@@ -836,19 +890,22 @@ def main():
     enrich_history(shortlist)
     shortlist = apply_hold_rules(shortlist)
 
+    used_fallback = False
     if ANTHROPIC_API_KEY:
         try:
             headline, picks = claude_rank(shortlist)
         except Exception as e:
             print(f"Claude ranking failed, using fallback: {e}", file=sys.stderr)
             headline, picks = fallback_rank(shortlist)
+            used_fallback = True
     else:
         headline, picks = fallback_rank(shortlist)
+        used_fallback = True
     picks = one_per_company(picks)
 
     overdue = pull_overdue_tasks()
 
-    html = build_html(headline, picks, counts, overdue)
+    html = build_html(headline, picks, counts, overdue, used_fallback)
     today = datetime.now(timezone.utc).strftime("%b %-d")
     send_email(html, f"Morning Outreach: {len(picks)} contacts to hit today ({today})")
     save_sent_log(runs, picks)
