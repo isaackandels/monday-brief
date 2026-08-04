@@ -29,7 +29,6 @@ MAX_CANDIDATES_PER_QUERY = 60 # pulled per HubSpot query
 MAX_STALE_DEALS = 30          # top open deals by ARR with no recent activity
 MAX_ENRICH = 40               # shortlist that gets full history + Claude ranking
 HISTORY_PER_CONTACT = 3       # recent emails/calls/meetings/notes per contact
-MAX_OVERDUE_PER_PERSON = 8    # overdue tasks listed per person
 TOP_PICKS = 12                # contacts in the final email
 
 CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -72,6 +71,7 @@ CONTACT_PROPS = [
     "contact_status", "new_customer_journey_stage",
     "existing_customer_journey_phase", "notes_last_contacted",
     "createdate", "hubspot_owner_id", "hs_analytics_last_timestamp",
+    "hs_sequences_is_enrolled",
 ]
 
 
@@ -298,10 +298,12 @@ def enrich_history(candidates):
     for etype, props in ENGAGEMENT_TYPES.items():
         try:
             assoc = batch_associations("contacts", ids, etype)
-            wanted = {oid for oids in assoc.values() for oid in oids[:10]}
+            # Association order is NOT chronological, so pull wide (60 per
+            # contact) and let the date sort below pick what's recent.
+            wanted = {oid for oids in assoc.values() for oid in oids[:60]}
             objects = batch_read_objects(etype, wanted, props)
             for cid, oids in assoc.items():
-                for oid in oids[:10]:
+                for oid in oids[:60]:
                     if oid in objects:
                         per_contact[cid].append(
                             engagement_summary(etype, objects[oid]))
@@ -332,6 +334,11 @@ def apply_hold_rules(candidates):
     kept = []
     for c in candidates:
         hold = False
+        if c.get("in_sequence"):
+            hold = True  # already being worked by a sequence
+        dsc = c.get("days_since_contacted")
+        if dsc is not None and dsc <= 1:
+            hold = True  # touched today/yesterday; actively being worked
         for h in c.pop("_all", []):
             future = h.get("days_ago") is not None and h["days_ago"] < 0
             if h["type"] == "meeting" and future:
@@ -512,6 +519,7 @@ def contact_record(c, source):
         "lane": "rep" if str(p.get("hubspot_owner_id")) in REPS else "marketing",
         "days_since_contacted": days_since(p.get("notes_last_contacted")),
         "days_since_site_visit": days_since(p.get("hs_analytics_last_timestamp")),
+        "in_sequence": str(p.get("hs_sequences_is_enrolled")).lower() == "true",
         "created_days_ago": days_since(p.get("createdate")),
         "link": f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{c['id']}",
     }
@@ -547,6 +555,10 @@ auto_reply (or with an out-of-office subject) is NOT engagement; treat that \
 thread as unanswered outbound. Skip anyone whose last exchange shows the \
 ball is in their court for a stated reason. In each reason, reference the \
 actual last conversation so the owner can pick the thread back up in one line.
+
+If history shows months of unanswered outbound (a completed sequence plus \
+manual follow-ups with no reply or engagement), do NOT pick them and never \
+frame that as an open loop; silence after that many touches is an answer.
 
 A candidate with "overdue_task" already has an open follow-up task past its \
 due date; include them and write the reason as clearing that task (e.g. \
@@ -644,14 +656,10 @@ FONT = "'Segoe UI',-apple-system,Helvetica,Arial,sans-serif"
 
 def build_html(headline, picks, counts, overdue=None):
     overdue = overdue or {}
-    groups = []
-    for rep in REPS.values():
-        rep_picks = [c for c in picks if c.get("owner") == rep]
-        if rep_picks:
-            groups.append((rep, rep_picks))
-    mkt = [c for c in picks if c.get("lane", "rep") == "marketing"]
-    if mkt:
-        groups.append(("Marketing / First Touch", mkt))
+    groups = [(rep, [c for c in picks if c.get("owner") == rep])
+              for rep in REPS.values()]
+    groups.append(("Marketing / First Touch",
+                   [c for c in picks if c.get("lane", "rep") == "marketing"]))
 
     pick_sections = "".join(section_block(t, g) for t, g in groups)
     overdue_section = overdue_block(overdue)
@@ -682,7 +690,7 @@ def build_html(headline, picks, counts, overdue=None):
 
   <tr><td style="padding:22px 32px 26px;">
     <div style="font-size:11px;color:#9AA3B2;border-top:1px solid {LINE};padding-top:14px;line-height:1.6;">
-      Generated automatically from HubSpot every Monday. Contacts with a future-dated task or a booked meeting are held out on purpose. Contacts picked in the last two briefs are rotated out.
+      Every name and task above links to its HubSpot record &mdash; click through to act. Contacts with a future-dated task, a booked meeting, an active sequence enrollment, or a touch in the last day are held out on purpose. Contacts picked in the last two briefs are rotated out.
     </div>
   </td></tr>
 
@@ -692,7 +700,12 @@ def build_html(headline, picks, counts, overdue=None):
 
 
 def section_block(title, group_picks):
-    rows = "".join(pick_row(i, c) for i, c in enumerate(group_picks, 1))
+    if group_picks:
+        rows = "".join(pick_row(i, c) for i, c in enumerate(group_picks, 1))
+    else:
+        rows = (f'<tr><td style="padding:12px 0 14px;border-bottom:1px solid {LINE};'
+                f'font-size:13px;color:{MUTED};font-style:italic;">'
+                f'No picks this week &mdash; nothing urgent surfaced, or everything is on a deliberate hold.</td></tr>')
     return f"""
   <tr><td style="padding:22px 32px 0;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
@@ -716,7 +729,7 @@ def pick_row(i, c):
         d = c["deal"]
         arr = f"${float(d['arr']):,.0f} ARR" if d.get("arr") else "no ARR set"
         deal_line = (f'<div style="font-size:13px;color:{MUTED};margin-top:3px;">'
-                     f'<a href="{d["link"]}" style="color:{ACCENT};text-decoration:none;font-weight:600;">{d["name"]}</a>'
+                     f'<a href="{d["link"]}" style="color:{ACCENT};text-decoration:underline;font-weight:600;">{d["name"]}</a>'
                      f' &nbsp;{arr} &nbsp;&middot;&nbsp; quiet {d["days_quiet"]} days</div>')
 
     task_line = ""
@@ -732,7 +745,7 @@ def pick_row(i, c):
     return f"""
     <tr><td style="padding:16px 0 14px;border-bottom:1px solid {LINE};">
       <div style="font-size:15.5px;">
-        <a href="{c['link']}" style="color:{NAVY};font-weight:700;text-decoration:none;">{i}. {c['name']}</a>
+        <a href="{c['link']}" style="color:{NAVY};font-weight:700;text-decoration:underline;">{i}. {c['name']}</a>
         &nbsp;<span style="font-size:10.5px;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;color:{ACCENT};background:#EAF0FE;padding:2px 7px;">{badge}</span>
       </div>
       <div style="font-size:13px;color:{MUTED};margin-top:3px;">{meta}</div>
@@ -749,9 +762,8 @@ def overdue_block(overdue):
         return ""
     blocks = []
     for person, tasks in people:
-        shown = tasks[:MAX_OVERDUE_PER_PERSON]
         rows = []
-        for t in shown:
+        for t in tasks:
             who = f' &nbsp;&middot;&nbsp; {t["contact"]}' if t.get("contact") else ""
             if t.get("days_overdue") is not None:
                 age = f'<span style="color:{ORANGE};font-weight:700;">{t["days_overdue"]}d overdue</span>'
@@ -759,17 +771,13 @@ def overdue_block(overdue):
                 age = f'<span style="color:{MUTED};font-weight:600;">open, no due date</span>'
             rows.append(
                 f'<tr><td style="padding:7px 0;border-bottom:1px solid #F0E7DF;font-size:13px;">'
-                f'<a href="{t["link"]}" style="color:{INK};text-decoration:none;font-weight:600;">{t["subject"]}</a>'
+                f'<a href="{t["link"]}" style="color:{ACCENT};text-decoration:underline;font-weight:600;">{t["subject"]}</a>'
                 f'<span style="color:{MUTED};">{who}</span>'
                 f' &nbsp;{age}</td></tr>')
-        more = ""
-        if len(tasks) > len(shown):
-            more = (f'<tr><td style="padding:6px 0;font-size:12px;color:{MUTED};">'
-                    f'+ {len(tasks) - len(shown)} more in HubSpot</td></tr>')
         blocks.append(
             f'<div style="font-size:13px;font-weight:700;color:{NAVY};margin:14px 0 2px;">{person}'
             f' &nbsp;<span style="font-weight:400;color:{MUTED};">({len(tasks)})</span></div>'
-            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{"".join(rows)}{more}</table>')
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{"".join(rows)}</table>')
     return f"""
   <tr><td style="padding:26px 32px 0;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
