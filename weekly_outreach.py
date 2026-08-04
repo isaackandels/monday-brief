@@ -557,6 +557,17 @@ thread as unanswered outbound. Skip anyone whose last exchange shows the \
 ball is in their court for a stated reason. In each reason, reference the \
 actual last conversation so the owner can pick the thread back up in one line.
 
+Recommend a concrete channel in every reason. Whenever two or more outbound \
+emails have gone unanswered or a thread has stalled, the recommendation is a \
+PHONE CALL, named explicitly ("Michelle should call Mark today"), never \
+"reach out" and never another email. Recommend email only to continue a live \
+thread.
+
+Calibrate urgency to the real gap. If the most recent event is an inbound \
+reply within the last 2 days, the ball just arrived: frame it as answering a \
+live conversation ("she replied yesterday asking about X; respond today and \
+keep momentum"), and never imply the contact was neglected.
+
 If history shows months of unanswered outbound (a completed sequence plus \
 manual follow-ups with no reply or engagement), do NOT pick them and never \
 frame that as an open loop; silence after that many touches is an answer.
