@@ -54,7 +54,8 @@ MARKETING = {
 OWNERS = {**REPS, **MARKETING}
 
 SENT_LOG = "sent_log.json"   # committed back by the workflow
-SKIP_RECENT_RUNS = 2         # weekly cadence: don't repeat a contact within 2 sends
+SKIP_RECENT_RUNS = 0         # 0 = no rotation: repeats allowed when still warranted;
+                             # sent_log.json is kept as a record of each send only
 
 # Closed/NA-stage exclusions for New Customer, Existing Customer, and DSO
 CLOSED_OR_NA_STAGES = [
@@ -360,6 +361,8 @@ def load_sent_log():
             runs = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return set(), []
+    if SKIP_RECENT_RUNS <= 0:
+        return set(), runs
     recent = runs[-SKIP_RECENT_RUNS:]
     return {i for r in recent for i in r.get("ids", [])}, runs
 
@@ -748,7 +751,7 @@ def build_html(headline, picks, counts, overdue=None, used_fallback=False):
 
   <tr><td style="padding:22px 32px 26px;">
     <div style="font-size:11px;color:#9AA3B2;border-top:1px solid {LINE};padding-top:14px;line-height:1.6;">
-      Every name and task above links to its HubSpot record &mdash; click through to act. Contacts with a future-dated task, a booked meeting, an active sequence enrollment, or a touch in the last day are held out on purpose. Contacts picked in the last two briefs are rotated out.
+      Every name and task above links to its HubSpot record &mdash; click through to act. Contacts with a future-dated task, a booked meeting, an active sequence enrollment, or a touch in the last day are held out on purpose. A contact may repeat week to week if they still warrant outreach.
     </div>
   </td></tr>
 
