@@ -29,6 +29,7 @@ MAX_CANDIDATES_PER_QUERY = 60 # pulled per HubSpot query
 MAX_STALE_DEALS = 30          # top open deals by ARR with no recent activity
 MAX_ENRICH = 40               # shortlist that gets full history + Claude ranking
 HISTORY_PER_CONTACT = 3       # recent emails/calls/meetings/notes per contact
+MAX_OVERDUE_PER_PERSON = 8    # overdue tasks listed per person
 TOP_PICKS = 12                # contacts in the final email
 
 CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -85,6 +86,24 @@ def hs_search(object_type, payload):
     )
     r.raise_for_status()
     return r.json().get("results", [])
+
+
+def hs_search_all(object_type, payload, max_pages=3):
+    """Follow search pagination; up to max_pages x 100 results."""
+    results, after = [], None
+    for _ in range(max_pages):
+        body = {**payload, "after": after} if after else payload
+        r = requests.post(
+            f"{HS_BASE}/crm/v3/objects/{object_type}/search",
+            headers=HS_HEADERS, json=body, timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+        results += data.get("results", [])
+        after = data.get("paging", {}).get("next", {}).get("after")
+        if not after:
+            break
+    return results
 
 
 def pull_journey_contacts(prop, stages, source_label):
@@ -208,12 +227,12 @@ AUTO_REPLY_PREFIXES = ("automatic reply", "out of office", "auto:",
                        "autoreply", "auto-reply", "ooo:")
 
 
-def batch_associations(contact_ids, to_type):
-    """Map contact id -> associated engagement ids, one API call per type."""
+def batch_associations(from_type, from_ids, to_type):
+    """Map object id -> associated object ids, one API call per pair."""
     r = requests.post(
-        f"{HS_BASE}/crm/v4/associations/contacts/{to_type}/batch/read",
+        f"{HS_BASE}/crm/v4/associations/{from_type}/{to_type}/batch/read",
         headers=HS_HEADERS, timeout=30,
-        json={"inputs": [{"id": i} for i in contact_ids]},
+        json={"inputs": [{"id": i} for i in from_ids]},
     )
     r.raise_for_status()
     mapping = {}
@@ -278,7 +297,7 @@ def enrich_history(candidates):
     per_contact = {i: [] for i in ids}
     for etype, props in ENGAGEMENT_TYPES.items():
         try:
-            assoc = batch_associations(ids, etype)
+            assoc = batch_associations("contacts", ids, etype)
             wanted = {oid for oids in assoc.values() for oid in oids[:10]}
             objects = batch_read_objects(etype, wanted, props)
             for cid, oids in assoc.items():
@@ -365,6 +384,97 @@ def trim_for_enrichment(candidates):
         key=lambda c: c.get("created_days_ago") or 9999,
     )
     return (priority + leads)[:MAX_ENRICH]
+
+
+def resolve_task_subjects(tasks):
+    """Map task id -> (label, record link) by walking associations in
+    priority order: contact, then deal, then company. Tasks live at all
+    three levels; a task with no contact still gets a meaningful name."""
+    resolved = {}
+    remaining = [t["id"] for t in tasks]
+    chains = [
+        ("contacts", ["firstname", "lastname", "email"], "0-1",
+         lambda p: " ".join(
+             x for x in [p.get("firstname"), p.get("lastname")] if x)
+         or p.get("email")),
+        ("deals", ["dealname"], "0-3", lambda p: p.get("dealname")),
+        ("companies", ["name"], "0-2", lambda p: p.get("name")),
+    ]
+    for obj_type, props, type_id, namer in chains:
+        if not remaining:
+            break
+        try:
+            assoc = batch_associations("tasks", remaining, obj_type)
+            wanted = {ids[0] for ids in assoc.values() if ids}
+            objects = batch_read_objects(obj_type, wanted, props) if wanted else {}
+        except requests.HTTPError as e:
+            print(f"Skipping task-{obj_type} resolution ({e}); "
+                  f"check private app scopes.", file=sys.stderr)
+            continue
+        still = []
+        for tid in remaining:
+            ids = assoc.get(tid) or []
+            name = namer(objects[ids[0]]) if ids and ids[0] in objects else None
+            if name:
+                resolved[tid] = (
+                    name,
+                    f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/{type_id}/{ids[0]}")
+            else:
+                still.append(tid)
+        remaining = still
+    return resolved
+
+
+def pull_overdue_tasks():
+    """Every open task past its due date for the five reps plus Isaac and
+    Bruno, grouped by owner, oldest first, with the associated contact
+    resolved so each row links to a person instead of a task id."""
+    now_ms = str(int(datetime.now(timezone.utc).timestamp() * 1000))
+    base = [
+        {"propertyName": "hubspot_owner_id", "operator": "IN",
+         "values": list(OWNERS)},
+        {"propertyName": "hs_task_status", "operator": "NEQ",
+         "value": "COMPLETED"},
+    ]
+    payload = {
+        # Filter groups are OR'd: past-due tasks, plus open tasks that
+        # never got a due date (otherwise invisible to any date filter).
+        "filterGroups": [
+            {"filters": base + [{"propertyName": "hs_timestamp",
+                                 "operator": "LT", "value": now_ms}]},
+            {"filters": base + [{"propertyName": "hs_timestamp",
+                                 "operator": "NOT_HAS_PROPERTY"}]},
+        ],
+        "properties": ["hs_task_subject", "hs_task_status", "hs_timestamp",
+                       "hubspot_owner_id"],
+        "sorts": [{"propertyName": "hs_timestamp", "direction": "ASCENDING"}],
+        "limit": 100,
+    }
+    tasks = hs_search_all("tasks", payload, max_pages=5)
+    if not tasks:
+        return {}
+    resolved = resolve_task_subjects(tasks)
+
+    per_owner = {}
+    for t in tasks:
+        p = t["properties"]
+        owner = OWNERS.get(str(p.get("hubspot_owner_id")))
+        if not owner:
+            continue
+        entry = {
+            "subject": clean(p.get("hs_task_subject"), 140) or "Untitled task",
+            "days_overdue": days_since(p.get("hs_timestamp")),
+            "link": f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-27/{t['id']}",
+        }
+        who = resolved.get(t["id"])
+        if who:
+            entry["contact"] = who[0]
+            entry["link"] = who[1]
+        per_owner.setdefault(owner, []).append(entry)
+    for tasks_ in per_owner.values():
+        tasks_.sort(key=lambda t: (t["days_overdue"] is None,
+                                   -(t["days_overdue"] or 0)))
+    return per_owner
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +632,18 @@ SOURCE_LABELS = {
 }
 
 
-def build_html(headline, picks, counts):
+NAVY = "#0B1F4D"
+ACCENT = "#4F7DF9"
+INK = "#1F2430"
+MUTED = "#6B7280"
+LINE = "#E4E8F0"
+ORANGE = "#C2410C"
+
+FONT = "'Segoe UI',-apple-system,Helvetica,Arial,sans-serif"
+
+
+def build_html(headline, picks, counts, overdue=None):
+    overdue = overdue or {}
     groups = []
     for rep in REPS.values():
         rep_picks = [c for c in picks if c.get("owner") == rep]
@@ -530,68 +651,133 @@ def build_html(headline, picks, counts):
             groups.append((rep, rep_picks))
     mkt = [c for c in picks if c.get("lane", "rep") == "marketing"]
     if mkt:
-        groups.append(("Marketing / first touch (Isaac + Bruno)", mkt))
+        groups.append(("Marketing / First Touch", mkt))
 
-    sections = []
-    for title, group_picks in groups:
-        rows = [pick_row(i, c) for i, c in enumerate(group_picks, 1)]
-        sections.append(
-            f'<h3 style="color:#0b1f4d;margin:20px 0 4px;font-size:14px;'
-            f'text-transform:uppercase;letter-spacing:0.5px;">{title}</h3>'
-            f'<table style="width:100%;border-collapse:collapse;">{"".join(rows)}</table>')
+    pick_sections = "".join(section_block(t, g) for t, g in groups)
+    overdue_section = overdue_block(overdue)
 
-    count_txt = " &middot; ".join(f"{v} {SOURCE_LABELS.get(k, k)}s" for k, v in counts.items() if v)
-    today = datetime.now(timezone.utc).strftime("%A, %B %-d")
+    pool = " &nbsp;&middot;&nbsp; ".join(
+        f"<strong style=\"color:{NAVY};\">{v}</strong> {SOURCE_LABELS.get(k, k).lower()}s"
+        for k, v in counts.items() if v)
+    today = datetime.now(timezone.utc).strftime("%A, %B %-d, %Y")
+
     return f"""
-    <div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;max-width:640px;margin:0 auto;color:#1a1a1a;">
-      <h2 style="color:#0b1f4d;margin-bottom:4px;">Morning Outreach List</h2>
-      <div style="color:#777;font-size:13px;margin-bottom:12px;">{today} &middot; candidate pool: {count_txt}</div>
-      <p style="font-size:14px;">{headline}</p>
-      {''.join(sections)}
-      <div style="color:#999;font-size:12px;margin-top:16px;">Generated automatically from HubSpot. Contacts with a future-dated task or booked meeting are held out on purpose.</div>
-    </div>"""
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F4F6FA;padding:24px 0;">
+<tr><td align="center">
+<table role="presentation" width="640" cellpadding="0" cellspacing="0" style="width:640px;max-width:640px;background:#FFFFFF;font-family:{FONT};color:{INK};">
+
+  <tr><td style="background:{NAVY};padding:26px 32px 22px;border-top:4px solid {ACCENT};">
+    <div style="font-size:11px;letter-spacing:2px;text-transform:uppercase;color:{ACCENT};font-weight:600;">DSN Software</div>
+    <div style="font-size:24px;font-weight:700;color:#FFFFFF;margin-top:4px;">Weekly Outreach Brief</div>
+    <div style="font-size:13px;color:#B8C4DE;margin-top:4px;">{today}</div>
+  </td></tr>
+
+  <tr><td style="padding:20px 32px 0;">
+    <div style="font-size:15px;line-height:1.55;color:{INK};">{headline}</div>
+    <div style="font-size:12px;color:{MUTED};margin-top:12px;padding-bottom:16px;border-bottom:1px solid {LINE};">Candidate pool &nbsp;&rarr;&nbsp; {pool}</div>
+  </td></tr>
+
+  {pick_sections}
+  {overdue_section}
+
+  <tr><td style="padding:22px 32px 26px;">
+    <div style="font-size:11px;color:#9AA3B2;border-top:1px solid {LINE};padding-top:14px;line-height:1.6;">
+      Generated automatically from HubSpot every Monday. Contacts with a future-dated task or a booked meeting are held out on purpose. Contacts picked in the last two briefs are rotated out.
+    </div>
+  </td></tr>
+
+</table>
+</td></tr>
+</table>"""
+
+
+def section_block(title, group_picks):
+    rows = "".join(pick_row(i, c) for i, c in enumerate(group_picks, 1))
+    return f"""
+  <tr><td style="padding:22px 32px 0;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td width="4" style="background:{ACCENT};font-size:0;line-height:0;">&nbsp;</td>
+      <td style="padding-left:10px;font-size:13px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:{NAVY};">{title}</td>
+    </tr></table>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{rows}</table>
+  </td></tr>"""
 
 
 def pick_row(i, c):
     badge = SOURCE_LABELS.get(c["source"], c["source"])
+    contacted = c.get("days_since_contacted")
+    contacted_txt = (f"last contacted {contacted}d ago" if contacted is not None
+                     else "no contact logged")
+    meta_bits = [b for b in [c.get("title"), c.get("company")] if b]
+    meta = " &middot; ".join(meta_bits + [contacted_txt])
+
     deal_line = ""
     if c.get("deal"):
         d = c["deal"]
         arr = f"${float(d['arr']):,.0f} ARR" if d.get("arr") else "no ARR set"
-        deal_line = (
-            f'<div style="font-size:13px;color:#555;margin-top:2px;">'
-            f'Deal: <a href="{d["link"]}" style="color:#1a3c8f;">{d["name"]}</a>'
-            f' &middot; {arr} &middot; quiet {d["days_quiet"]} days</div>'
-        )
+        deal_line = (f'<div style="font-size:13px;color:{MUTED};margin-top:3px;">'
+                     f'<a href="{d["link"]}" style="color:{ACCENT};text-decoration:none;font-weight:600;">{d["name"]}</a>'
+                     f' &nbsp;{arr} &nbsp;&middot;&nbsp; quiet {d["days_quiet"]} days</div>')
+
     task_line = ""
     if c.get("overdue_task"):
-        task_line = (
-            f'<div style="font-size:13px;color:#b3541e;margin-top:2px;">'
-            f'&#9888; Overdue task: {c["overdue_task"]}</div>'
-        )
-    contacted = c.get("days_since_contacted")
-    contacted_txt = (
-        f"last contacted {contacted}d ago" if contacted is not None
-        else "no contact logged"
-    )
-    reason = (
-        f'<div style="font-size:13px;color:#1a3c8f;margin-top:4px;">{c["reason"]}</div>'
-        if c.get("reason") else ""
-    )
+        task_line = (f'<div style="font-size:12.5px;color:{ORANGE};margin-top:4px;font-weight:600;">'
+                     f'&#9888;&nbsp; Overdue task: {c["overdue_task"]}</div>')
+
+    reason = ""
+    if c.get("reason"):
+        reason = (f'<div style="font-size:13.5px;color:{INK};margin-top:6px;line-height:1.5;'
+                  f'background:#F5F8FF;padding:8px 12px;">{c["reason"]}</div>')
+
     return f"""
-    <tr><td style="padding:12px 0;border-bottom:1px solid #e6e6e6;">
-      <div style="font-size:15px;">
-        <strong>{i}. <a href="{c['link']}" style="color:#0b1f4d;">{c['name']}</a></strong>
-        <span style="background:#eef2fb;color:#1a3c8f;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:6px;">{badge}</span>
+    <tr><td style="padding:16px 0 14px;border-bottom:1px solid {LINE};">
+      <div style="font-size:15.5px;">
+        <a href="{c['link']}" style="color:{NAVY};font-weight:700;text-decoration:none;">{i}. {c['name']}</a>
+        &nbsp;<span style="font-size:10.5px;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;color:{ACCENT};background:#EAF0FE;padding:2px 7px;">{badge}</span>
       </div>
-      <div style="font-size:13px;color:#555;margin-top:2px;">
-        {c.get('title') or ''}{' &middot; ' if c.get('title') and c.get('company') else ''}{c.get('company') or ''}
-        &middot; owner: {c['owner']} &middot; {contacted_txt}
-      </div>
+      <div style="font-size:13px;color:{MUTED};margin-top:3px;">{meta}</div>
       {deal_line}
       {task_line}
       {reason}
     </td></tr>"""
+
+
+def overdue_block(overdue):
+    order = list(REPS.values()) + list(MARKETING.values())
+    people = [(p, overdue[p]) for p in order if overdue.get(p)]
+    if not people:
+        return ""
+    blocks = []
+    for person, tasks in people:
+        shown = tasks[:MAX_OVERDUE_PER_PERSON]
+        rows = []
+        for t in shown:
+            who = f' &nbsp;&middot;&nbsp; {t["contact"]}' if t.get("contact") else ""
+            if t.get("days_overdue") is not None:
+                age = f'<span style="color:{ORANGE};font-weight:700;">{t["days_overdue"]}d overdue</span>'
+            else:
+                age = f'<span style="color:{MUTED};font-weight:600;">open, no due date</span>'
+            rows.append(
+                f'<tr><td style="padding:7px 0;border-bottom:1px solid #F0E7DF;font-size:13px;">'
+                f'<a href="{t["link"]}" style="color:{INK};text-decoration:none;font-weight:600;">{t["subject"]}</a>'
+                f'<span style="color:{MUTED};">{who}</span>'
+                f' &nbsp;{age}</td></tr>')
+        more = ""
+        if len(tasks) > len(shown):
+            more = (f'<tr><td style="padding:6px 0;font-size:12px;color:{MUTED};">'
+                    f'+ {len(tasks) - len(shown)} more in HubSpot</td></tr>')
+        blocks.append(
+            f'<div style="font-size:13px;font-weight:700;color:{NAVY};margin:14px 0 2px;">{person}'
+            f' &nbsp;<span style="font-weight:400;color:{MUTED};">({len(tasks)})</span></div>'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{"".join(rows)}{more}</table>')
+    return f"""
+  <tr><td style="padding:26px 32px 0;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td width="4" style="background:{ORANGE};font-size:0;line-height:0;">&nbsp;</td>
+      <td style="padding-left:10px;font-size:13px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:{NAVY};">Overdue Tasks</td>
+    </tr></table>
+    {''.join(blocks)}
+  </td></tr>"""
 
 
 def send_email(html, subject):
@@ -652,7 +838,9 @@ def main():
         headline, picks = fallback_rank(shortlist)
     picks = one_per_company(picks)
 
-    html = build_html(headline, picks, counts)
+    overdue = pull_overdue_tasks()
+
+    html = build_html(headline, picks, counts, overdue)
     today = datetime.now(timezone.utc).strftime("%b %-d")
     send_email(html, f"Morning Outreach: {len(picks)} contacts to hit today ({today})")
     save_sent_log(runs, picks)
