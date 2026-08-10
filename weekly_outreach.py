@@ -73,8 +73,10 @@ CONTACT_PROPS = [
     "contact_status", "new_customer_journey_stage",
     "existing_customer_journey_phase", "notes_last_contacted",
     "createdate", "hubspot_owner_id", "hs_analytics_last_timestamp",
-    "hs_sequences_is_enrolled",
+    "hs_sequences_is_enrolled", "associatedcompanyid",
 ]
+
+EXCLUDED_SPECIALTIES = {"Endodontist"}  # company practice_type values to skip
 
 
 # ---------------------------------------------------------------------------
@@ -525,8 +527,33 @@ def contact_record(c, source):
         "days_since_site_visit": days_since(p.get("hs_analytics_last_timestamp")),
         "in_sequence": str(p.get("hs_sequences_is_enrolled")).lower() == "true",
         "created_days_ago": days_since(p.get("createdate")),
+        "company_id": p.get("associatedcompanyid"),
         "link": f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{c['id']}",
     }
+
+
+def drop_excluded_specialties(candidates):
+    """Remove candidates whose associated company practice_type is excluded
+    (e.g. endodontists, until endo cloud ships)."""
+    company_ids = {c["company_id"] for c in candidates if c.get("company_id")}
+    if not company_ids:
+        return candidates
+    try:
+        companies = batch_read_objects("companies", company_ids,
+                                       ["practice_type"])
+    except requests.HTTPError as e:
+        print(f"Skipping specialty filter ({e}).", file=sys.stderr)
+        return candidates
+    kept = []
+    for c in candidates:
+        ptype = companies.get(str(c.get("company_id")), {}).get("practice_type")
+        if ptype in EXCLUDED_SPECIALTIES:
+            continue
+        kept.append(c)
+    dropped = len(candidates) - len(kept)
+    if dropped:
+        print(f"Dropped {dropped} candidates by specialty filter.")
+    return kept
 
 
 def dedupe(candidates):
@@ -544,8 +571,11 @@ def dedupe(candidates):
 # ---------------------------------------------------------------------------
 
 RANK_INSTRUCTIONS = """You are a sales ops analyst for DSN Software, a vertical \
-SaaS for oral surgery, perio, and endo practices. From the candidate JSON below, \
-pick the {n} contacts most worth a call or email TODAY and return them ranked.
+SaaS for oral surgery, perio, and endo practices. Today's date is {today}. \
+Anchor ALL time reasoning to that date: compute what month it is, whether a \
+requested callback window has actually arrived, and how long gaps really are. \
+From the candidate JSON below, pick the {n} contacts most worth a call or \
+email TODAY and return them ranked.
 
 Candidate sources:
 - new_mql / new_lead: prospect journey (net-new business)
@@ -602,7 +632,9 @@ def claude_rank(candidates):
         "messages": [{
             "role": "user",
             "content": RANK_INSTRUCTIONS.format(
-                n=TOP_PICKS, candidates=json.dumps(candidates, default=str)
+                n=TOP_PICKS,
+                today=datetime.now(timezone.utc).strftime("%A, %B %d, %Y"),
+                candidates=json.dumps(candidates, default=str),
             ) + "\n\nBegin your reply with { immediately. No preamble.",
         }],
     }
@@ -885,6 +917,7 @@ def main():
     candidates += pull_warm_signals()
     candidates += pull_stale_deal_contacts()
     candidates = dedupe(candidates)
+    candidates = drop_excluded_specialties(candidates)
 
     recent_ids, runs = load_sent_log()
     candidates = [c for c in candidates if c["id"] not in recent_ids]
